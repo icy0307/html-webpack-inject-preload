@@ -24,9 +24,9 @@ describe('HTMLWebpackInjectPreload test entry point webpack preload for css', ()
             const result = html.match(globalPreloadRegex);
             expect(result).not.toBeNull();
             expect(result?.length).toBe(2);
-            const cssPreload = result![0].match(preloadRegex);
+            const cssPreload = result![1].match(preloadRegex);
             expect(cssPreload![1]).toBe('style');
-            const jsPreload = result![1].match(preloadRegex);
+            const jsPreload = result![0].match(preloadRegex);
             expect(jsPreload![1]).toBe('script');
             done();
         });

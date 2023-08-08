@@ -9,11 +9,16 @@ type AlterAssetTagGroupsHookParam = Parameters<Parameters<HtmlWebpackPluginInsta
 
 type EntryName = string;
 type File = string;
+type ParentChunkFile = string;
 
 export function addLinkForEntryPointWebpackPreload(
     compilation: Compilation,
     htmlPluginData: AlterAssetTagGroupsHookParam,
-    ) {
+) {
+
+    if (htmlPluginData.plugin.options?.inject === false) {
+        return;
+    }
     
     // Html can contain multiple entrypoints, entries contains preloaded ChunkGroups, ChunkGroups contains chunks, chunks contains files.
     // Files are what we need.
@@ -23,32 +28,51 @@ export function addLinkForEntryPointWebpackPreload(
     // Prepare link tags for HtmlWebpackPlugin
     const publicPath = getPublicPath(compilation, htmlPluginData);
     const entryHtmlTagObjectMap = generateHtmlTagObject(entryFileMap, publicPath, compilation);
-    
-    // Related files's link tags should follow parent script tag (the entries scripts' tag)
+
+    // Related files's link tags should follow parent script tag
     // according to this [blog](https://web.dev/priority-hints/#using-preload-after-chrome-95).
     alterAssetTagGroups(entryHtmlTagObjectMap, compilation, htmlPluginData);
 }
 
-function alterAssetTagGroups(entryHtmlTagObjectMap: Map<EntryName, Set<HtmlTagObject>>, compilation: Compilation, htmlPluginData: AlterAssetTagGroupsHookParam) {
-    for (const [entryName, linkTags] of entryHtmlTagObjectMap) {
-        //Find first link index to inject before, which is the script elemet for the entrypoint.
-        let files = compilation.entrypoints.get(entryName)?.getEntrypointChunk().files;
-        if (!files || files.size === 0) {
-            continue;
+function getInjectPos(htmlPluginData: AlterAssetTagGroupsHookParam) {
+    if (htmlPluginData.plugin.options?.inject === 'body') {
+        return 'bodyTags';
+    }
+    if (htmlPluginData.plugin.options?.inject === 'head') {
+        return 'headTags';
+    }
+
+    if (htmlPluginData.plugin.options?.inject === false) {
+        return false;
+    }
+    
+    if (htmlPluginData.plugin.options?.inject === true && htmlPluginData.plugin.options?.scriptLoading === 'blocking') {
+        return 'bodyTags';
+    }
+    return 'headTags';
+}
+
+function alterAssetTagGroups(entryHtmlTagObjectMap: Map<EntryName, Map<HtmlTagObject, Array<ParentChunkFile>>>, compilation: Compilation, htmlPluginData: AlterAssetTagGroupsHookParam) {
+    const injectPos = getInjectPos(htmlPluginData);
+    if (injectPos === false) {
+        return;
+    }
+    for (const [entryName, linkTagsWithParentId] of entryHtmlTagObjectMap) {
+        for (const [linkTag, parentFiles] of linkTagsWithParentId) {
+            let insertIndex = -1;
+            for (const parentFile of parentFiles) {
+                const findLastFileScriptTagIndex = tag => tag.tagName === 'script' && (tag.attributes.src as string).indexOf(parentFile) !== -1;
+                const linkIndex = htmlPluginData[injectPos].findIndex(
+                    findLastFileScriptTagIndex
+                );
+                insertIndex = linkIndex > insertIndex ? linkIndex : insertIndex;
+            }
+            if (insertIndex === -1) {
+                console.warn(`cannot find entrypoints\'s script tags for entry: ${entryName}, files: ${parentFiles}`);
+                continue;
+            };
+            htmlPluginData.headTags.splice(insertIndex+1, 0, linkTag);
         }
-        const lastFile = [...files][files.size - 1]
-        const findLastFileScriptTagIndex = tag => tag.tagName === 'script' && (tag.attributes.src as string).indexOf(lastFile) !== -1;
-        let linkIndex = htmlPluginData.headTags.findIndex(
-            findLastFileScriptTagIndex
-        );
-        if (linkIndex === -1) {
-            htmlPluginData.bodyTags.findIndex(findLastFileScriptTagIndex);
-        }
-        if (linkIndex === -1) {
-            console.warn(`cannot find entrypoints\'s script tags for entry: ${entryName}`);
-            continue;
-        };
-        htmlPluginData.headTags.splice(linkIndex, 0, ...linkTags);
     }
 }
 
@@ -63,20 +87,23 @@ function alterAssetTagGroups(entryHtmlTagObjectMap: Map<EntryName, Set<HtmlTagOb
 function prepareEntryFileMap(
     compilation: Compilation,
     htmlPluginData: AlterAssetTagGroupsHookParam) {
-    const entryFileMap = new Map<EntryName, Set<File>>;
-    
+    const entryFileMap = new Map<EntryName, Map<File, Array<ParentChunkFile>>>;
+
     const entries = htmlPluginData.plugin.options?.chunks ?? 'all';
     let entriesKeys = Array.isArray(entries) ? entries : Array.from(compilation.entrypoints.keys());
-    
+
     for (const key of entriesKeys) {
-        const files = new Set<string>();
         const preloaded = compilation.entrypoints.get(key)?.getChildrenByOrders(compilation.moduleGraph, compilation.chunkGraph).preload;
         if (!preloaded) continue;
-        entryFileMap.set(key, files);
+        entryFileMap.set(key, new Map());
         // cannot get font files in `preload`
         for (const group of preloaded) { // the order of preloaded is relevant
-            for (const chunk of group.chunks)
-                for (const file of chunk.files) files.add(file);
+            for (const chunk of group.chunks) {
+                const parentChunkFiles = group.getParents().flatMap(c => c.getFiles());
+                for (const file of chunk.files) {
+                    entryFileMap.get(key)?.set(file, parentChunkFiles);
+                };
+            }
         }
     }
 
@@ -89,10 +116,12 @@ function prepareEntryFileMap(
  * @param publicPath 
  * @returns 
  */
-function generateHtmlTagObject(entryFileMap: Map<string, Set<string>>, publicPath: string, compilation: Compilation): Map<EntryName, Set<HtmlTagObject>> {
-    const map = new Map();
-    for (const [key, filesNames] of entryFileMap) {
-        map.set(key, [...filesNames].map(fileName => {
+function generateHtmlTagObject(entryFileMap: Map<EntryName, Map<File, Array<ParentChunkFile>>>, publicPath: string, compilation: Compilation): Map<EntryName, Map<HtmlTagObject, Array<ParentChunkFile>>> {
+    const map = new Map<EntryName, Map<HtmlTagObject, Array<ParentChunkFile>>>();
+    for (const [key, fileParentsMap] of entryFileMap) {
+        const linkTagWithParentFiles = new Map<HtmlTagObject, Array<ParentChunkFile>>();
+        map.set(key, linkTagWithParentFiles);
+        fileParentsMap.forEach((parentFiles, fileName) => {
             const href = `${publicPath}${fileName}`;
             const as = getTypeOfResource(fileName);
             const crossOrigin = as === 'font' ? 'anonymous' : compilation.outputOptions.crossOriginLoading;
@@ -104,7 +133,7 @@ function generateHtmlTagObject(entryFileMap: Map<string, Set<string>>, publicPat
             if (crossOrigin) {
                 attributes = { ...attributes, crossorigin: crossOrigin }
             }
-            return {
+            const linkTag = {
                 tagName: 'link',
                 attributes,
                 voidTag: true,
@@ -112,8 +141,8 @@ function generateHtmlTagObject(entryFileMap: Map<string, Set<string>>, publicPat
                     plugin: 'html-webpack-inject-preload',
                 },
             }
-        }));
-        
+            linkTagWithParentFiles.set(linkTag, parentFiles);
+        });
     }
     return map;
 }
